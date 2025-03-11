@@ -7,6 +7,8 @@ import random
 import threading
 import traceback
 import uuid
+import json
+import sqlite3
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any
@@ -72,10 +74,15 @@ class CARBS:
               to a log space `lr = LogSpace(max=1)`
     """
 
-    def __init__(self, config: CARBSParams, params: List[Param]) -> None:
+    def __init__(self, config: CARBSParams, params: List[Param], db_path: Optional[str] = None) -> None:
         logger.info(f"Running CARBS with config {config}")
         self.config = config
         self.params = params
+        self.db_path = db_path  # NEW: path to your SQLite DB, if any
+
+        if self.db_path:
+            self._init_db_tables()  # create the table(s) if not exists
+
         experiment_name = os.environ.get(
             "EXPERIMENT_NAME", config.wandb_params.run_name
         )
@@ -141,6 +148,98 @@ class CARBS:
         self.device = "cpu"
         if torch.cuda.is_available():
             self.device = f"cuda:{torch.cuda.current_device()}"
+
+    def _init_db_tables(self) -> None:
+        """Create 'observations' and 'outstanding_suggestions' tables if they don't exist."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        # 1) Observations table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS observations (
+                row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                suggestion_id TEXT,
+                param_json TEXT,
+                output REAL,
+                cost REAL,
+                is_failure BOOLEAN,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # 2) (Optional) Outstanding Suggestions
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS outstanding_suggestions (
+                suggestion_id TEXT PRIMARY KEY,
+                param_json TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+    # ------------------------------------------
+    # (B) Save Observations to DB
+    # ------------------------------------------
+    def _save_observation_to_db(self, observation: ObservationInParam) -> None:
+        """Insert one row for the new ObservationInParam."""
+        if not self.db_path:
+            return  # No DB path, do nothing
+
+        # Convert the input dictionary to JSON
+        param_json = json.dumps(observation.input)
+        suggestion_id = observation.input.get(SUGGESTION_ID_DICT_KEY, str(uuid.uuid4()))
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO observations (suggestion_id, param_json, output, cost, is_failure)
+                VALUES (?, ?, ?, ?, ?)
+            """, (
+                suggestion_id,
+                param_json,
+                float(observation.output),
+                float(observation.cost),
+                bool(observation.is_failure),
+            ))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Failed inserting observation into DB: {e}")
+
+    # ------------------------------------------
+    # (C) Save Outstanding Suggestions to DB
+    # ------------------------------------------
+    def _save_outstanding_suggestion_to_db(self, suggestion_id: str, suggestion_in_param: ParamDictType) -> None:
+        if not self.db_path:
+            return
+
+        param_json = json.dumps(suggestion_in_param)
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            # Use INSERT OR REPLACE so if it exists, we overwrite
+            cursor.execute("""
+                INSERT OR REPLACE INTO outstanding_suggestions (suggestion_id, param_json)
+                VALUES (?, ?)
+            """, (suggestion_id, param_json))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Failed inserting suggestion to DB: {e}")
+
+    def _delete_outstanding_suggestion_from_db(self, suggestion_id: str) -> None:
+        if not self.db_path:
+            return
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM outstanding_suggestions WHERE suggestion_id = ?", (suggestion_id,))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Failed deleting suggestion from DB: {e}")
+
 
     def set_search_center(self, input_in_param: ParamDictType) -> None:
         self.search_center_in_basic = self._param_space_real_to_basic_space_real(
@@ -230,10 +329,12 @@ class CARBS:
         with self._suggest_or_observe_lock:
             self.forget_suggestion(new_observation_in_param.input)
             self._add_observation(new_observation_in_param)
+            # NEW: insert row in DB
+            self._save_observation_to_db(new_observation_in_param)
             logs = self._get_observation_log(new_observation_in_param)
 
-            if self.config.is_saved_on_every_observation:
-                self._autosave()
+            # if self.config.is_saved_on_every_observation:
+            #     self._autosave()
 
             return ObserveOutput(logs=logs)
 
@@ -246,6 +347,7 @@ class CARBS:
             assert isinstance(suggestion_index, str)
             if suggestion_index in self.outstanding_suggestions:
                 del self.outstanding_suggestions[suggestion_index]
+                self._delete_outstanding_suggestion_from_db(suggestion_index)
             else:
                 logger.info(f"Got unrecognized suggestion uuid `{suggestion_index}`")
         else:
@@ -353,6 +455,10 @@ class CARBS:
             suggestion_id = str(uuid.uuid4())
         suggestion_in_param[SUGGESTION_ID_DICT_KEY] = suggestion_id
         self.outstanding_suggestions[suggestion_id] = suggestion_in_basic
+
+        # NEW: Save to DB
+        self._save_outstanding_suggestion_to_db(suggestion_id, suggestion_in_param)
+
         return suggestion_in_param
 
     def _add_observation(
@@ -850,6 +956,61 @@ class CARBS:
         return cls.load_from_file(
             io.BytesIO(base64.b64decode(state)), is_wandb_logging_enabled
         )
+
+
+    # ------------------------------------------------
+    # Provide a load_from_db method to re-initialize
+    # ------------------------------------------------
+    @classmethod
+    def load_from_db(
+        cls,
+        config: CARBSParams,
+        params: List[Param],
+        db_path: str,
+    ) -> "CARBS":
+        """
+        Create a new CARBS instance, read all observations/suggestions from the DB,
+        rebuild success/failure/outstanding_suggestions in memory.
+        """
+        optimizer = cls(config, params, db_path=db_path)
+
+        # 1) Rebuild Observations
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        rows = cursor.execute("""
+            SELECT suggestion_id, param_json, output, cost, is_failure
+            FROM observations
+            ORDER BY row_id ASC
+        """).fetchall()
+        conn.close()
+        
+        for suggestion_id, param_json, output, cost, is_failure in rows:
+            param_dict = json.loads(param_json)
+            obs = ObservationInParam(
+                input=param_dict,
+                output=float(output),
+                cost=float(cost),
+                is_failure=bool(is_failure),
+            )
+            optimizer._add_observation(obs)  # fill success_observations/failure_observations
+
+        # 2) Rebuild outstanding suggestions
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        rows = cursor.execute("""
+            SELECT suggestion_id, param_json
+            FROM outstanding_suggestions
+        """).fetchall()
+        conn.close()
+
+        for suggestion_id, param_json in rows:
+            param_dict = json.loads(param_json)
+            real_input = optimizer._param_space_real_to_basic_space_real(param_dict)
+            suggestion_in_basic = SuggestionInBasic(real_number_input=real_input)
+            optimizer.outstanding_suggestions[suggestion_id] = suggestion_in_basic
+
+        return optimizer
+
 
     def get_state_dict(self) -> Dict[str, Any]:
         outstanding_suggestions: Dict[str, SuggestionInBasic] = {}
