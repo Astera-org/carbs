@@ -1063,86 +1063,63 @@ class CARBS:
 
     def warm_start(
         self,
-        filename: str,
         is_prior_observation_valid: bool = False,
         added_parameters: Optional[ParamDictType] = None,
     ) -> None:
-        prior_carbs = CARBS.load_from_file(filename)
+        if not self.db_path:
+            raise ValueError("DB path must be provided for warm_start from DB.")
 
-        # Copying over observations
-        if is_prior_observation_valid:
-            prior_keys = set(prior_carbs.param_space_by_name.keys())
-            current_keys = set(self.param_space_by_name.keys())
-            added_keys = (
-                set() if added_parameters is None else set(added_parameters.keys())
-            )
-            assert_empty(
-                prior_keys - current_keys,
-                "Prior observations used params that are not included in search",
-            )
-            assert_empty(
-                current_keys - (prior_keys | added_keys), "Pass in added parameters"
-            )
-            assert_empty(added_keys & prior_keys, "Cannot add param already in prior")
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
 
-            for prior_observation_in_basic in prior_carbs.success_observations:
-                prior_observation_in_params = prior_carbs._basic_space_to_param_space(
-                    prior_observation_in_basic.real_number_input
+        # Load successful and failed observations
+        obs_rows = cursor.execute(
+            """
+            SELECT param_json, output, cost, is_failure
+            FROM observations
+            ORDER BY row_id ASC
+            """
+        ).fetchall()
+
+        for param_json, output, cost, is_failure in obs_rows:
+            param_dict = json.loads(param_json)
+
+            if added_parameters is not None:
+                param_dict.update(added_parameters)
+
+            try:
+                observation = ObservationInParam(
+                    input=param_dict,
+                    output=output,
+                    cost=cost,
+                    is_failure=bool(is_failure)
                 )
-                if added_parameters is not None:
-                    prior_observation_in_params.update(added_parameters)
+                self._add_observation(observation)
+            except ValueError as e:
+                logger.warning(f"Skipping observation {param_dict} due to error: {e}")
 
-                try:
-                    self._add_observation(
-                        ObservationInParam(
-                            input=prior_observation_in_params,
-                            output=prior_observation_in_basic.output,
-                            cost=prior_observation_in_basic.cost,
-                        )
-                    )
-                except ValueError as e:
-                    logger.warning(
-                        f"Observation {prior_observation_in_params} not valid in current space: {e}; skipping"
-                    )
+        # Load outstanding suggestions
+        sugg_rows = cursor.execute("SELECT row_id, param_json FROM outstanding_suggestions").fetchall()
 
-            logger.info(
-                f"Loaded {len(self.success_observations)} observations from prior run"
+        for row_id, param_json in sugg_rows:
+            param_dict = json.loads(param_json)
+            real_number_input = self._param_space_real_to_basic_space_real(param_dict)
+            suggestion_in_basic = SuggestionInBasic(real_number_input=real_number_input)
+            self.outstanding_suggestions[row_id] = suggestion_in_basic
+
+        conn.close()
+
+        # Set search center to best previous observation
+        if self.success_observations:
+            best_observation_in_basic = max(
+                self.success_observations,
+                key=lambda x: x.output * self.config.better_direction_sign
             )
-
-            for prior_observation_in_basic in prior_carbs.failure_observations:
-                prior_observation_in_params = prior_carbs._basic_space_to_param_space(
-                    prior_observation_in_basic.real_number_input
-                )
-                if added_parameters is not None:
-                    prior_observation_in_params.update(added_parameters)
-
-                try:
-                    self._add_observation(
-                        ObservationInParam(
-                            input=prior_observation_in_params,
-                            output=prior_observation_in_basic.output,
-                            cost=prior_observation_in_basic.cost,
-                            is_failure=True,
-                        )
-                    )
-                except ValueError as e:
-                    logger.warning(
-                        f"Observation {prior_observation_in_params} not valid in current space: {e}; skipping"
-                    )
-
-            logger.info(
-                f"Loaded {len(self.failure_observations)} failed observations from prior run"
+            best_observation_in_param = self._basic_space_to_param_space(
+                best_observation_in_basic.real_number_input
             )
+            self.set_search_center(best_observation_in_param)
 
-            self.resample_count = prior_carbs.resample_count
+        logger.info(f"Warm-started from DB with {len(self.success_observations)} successful and {len(self.failure_observations)} failed observations.")
 
-        if added_parameters is not None:
-            for param_name, param_value in added_parameters.items():
-                if param_name in self._real_number_space_by_name:
-                    param_idx = ordered_dict_index(
-                        self._real_number_space_by_name, param_name
-                    )
-                    param_value_in_basic = self._real_number_space_by_name[
-                        param_name
-                    ].basic_from_param(param_value)
-                    self.search_center_in_basic[param_idx] = param_value_in_basic
+        conn.close()
