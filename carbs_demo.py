@@ -39,6 +39,7 @@ carbs_params = CARBSParams(
 carbs = CARBS(carbs_params, param_spaces, db_path="observations.db")
 for i in range(4):
     suggestion = carbs.suggest().suggestion
+    print(suggestion)
     observed_value = run_test_fn(suggestion)
     obs_out = carbs.observe(ObservationInParam(input=suggestion, output=observed_value, cost=suggestion["epochs"]))
     logger.info(f"Observation {obs_out.logs['observation_count']}")

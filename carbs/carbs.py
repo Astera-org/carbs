@@ -158,7 +158,6 @@ class CARBS:
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS observations (
                 row_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                suggestion_id TEXT,
                 param_json TEXT,
                 output REAL,
                 cost REAL,
@@ -170,7 +169,7 @@ class CARBS:
         # 2) (Optional) Outstanding Suggestions
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS outstanding_suggestions (
-                suggestion_id TEXT PRIMARY KEY,
+                row_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 param_json TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
@@ -182,21 +181,17 @@ class CARBS:
     # (B) Save Observations to DB
     # ------------------------------------------
     def _save_observation_to_db(self, observation: ObservationInParam) -> None:
-        """Insert one row for the new ObservationInParam."""
         if not self.db_path:
-            return  # No DB path, do nothing
-
-        # Convert the input dictionary to JSON
-        param_json = json.dumps(observation.input)
-        suggestion_id = observation.input.get(SUGGESTION_ID_DICT_KEY, str(uuid.uuid4()))
+            return
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
+
+            param_json = json.dumps(observation.input)
             cursor.execute("""
-                INSERT INTO observations (suggestion_id, param_json, output, cost, is_failure)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO observations (param_json, output, cost, is_failure)
+                VALUES (?, ?, ?, ?)
             """, (
-                suggestion_id,
                 param_json,
                 float(observation.output),
                 float(observation.cost),
@@ -206,6 +201,8 @@ class CARBS:
             conn.close()
         except Exception as e:
             logger.error(f"Failed inserting observation into DB: {e}")
+
+
 
     # ------------------------------------------
     # (C) Save Outstanding Suggestions to DB
@@ -228,17 +225,17 @@ class CARBS:
         except Exception as e:
             logger.error(f"Failed inserting suggestion to DB: {e}")
 
-    def _delete_outstanding_suggestion_from_db(self, suggestion_id: str) -> None:
+    def _delete_outstanding_suggestion_from_db(self, row_id: int) -> None:
         if not self.db_path:
             return
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
-            cursor.execute("DELETE FROM outstanding_suggestions WHERE suggestion_id = ?", (suggestion_id,))
+            cursor.execute("DELETE FROM outstanding_suggestions WHERE row_id = ?", (row_id,))
             conn.commit()
             conn.close()
         except Exception as e:
-            logger.error(f"Failed deleting suggestion from DB: {e}")
+            logger.error(f"Failed deleting suggestion row_id={row_id} from DB: {e}")
 
 
     def set_search_center(self, input_in_param: ParamDictType) -> None:
@@ -264,7 +261,8 @@ class CARBS:
         with self._suggest_or_observe_lock:
             if self._is_random_sampling():
                 return self._get_random_suggestion(
-                    suggestion_id, is_suggestion_remembered
+                    suggestion_id, 
+                    is_suggestion_remembered
                 )
 
             suggestion_in_basic: Optional[SuggestionInBasic]
@@ -281,7 +279,7 @@ class CARBS:
                     self._remember_suggestion(
                         suggestion_in_param,
                         suggestion_in_basic,
-                        suggestion_id=suggestion_id,
+                        # suggestion_id=suggestion_id,
                     )
                 return SuggestOutput(suggestion=suggestion_in_param)
 
@@ -296,7 +294,8 @@ class CARBS:
             if suggestion_in_basic is None:
                 logger.warning("No candidates found, choosing at random")
                 return self._get_random_suggestion(
-                    suggestion_id, is_suggestion_remembered
+                    suggestion_id, 
+                    is_suggestion_remembered
                 )
 
             suggestion_in_param = self._basic_space_to_param_space(
@@ -306,7 +305,7 @@ class CARBS:
                 self._remember_suggestion(
                     suggestion_in_param,
                     suggestion_in_basic,
-                    suggestion_id=suggestion_id,
+                    # suggestion_id=suggestion_id,
                 )
             log_dict = self._get_suggestion_log(
                 suggestion_in_param, suggestion_in_basic
@@ -326,8 +325,13 @@ class CARBS:
             is_failure: bool = False -- Should be True if training did not complete properly (eg OOM error)
         )
         """
+        print(new_observation_in_param)
         with self._suggest_or_observe_lock:
-            self.forget_suggestion(new_observation_in_param.input)
+            # Retrieve row_id from observation input to forget suggestion
+            row_id = new_observation_in_param.input.pop("row_id", None)
+            if row_id is not None:
+                self.forget_suggestion(row_id)
+            # self.forget_suggestion(new_observation_in_param.input)
             self._add_observation(new_observation_in_param)
             # NEW: insert row in DB
             self._save_observation_to_db(new_observation_in_param)
@@ -338,20 +342,16 @@ class CARBS:
 
             return ObserveOutput(logs=logs)
 
-    def forget_suggestion(self, suggestion_to_forget: ParamDictType) -> None:
+    def forget_suggestion(self, row_id: int) -> None:
         """
-        Removes suggestion from outstanding_suggestions
+        Given a row_id, remove from memory and DB.
         """
-        if SUGGESTION_ID_DICT_KEY in suggestion_to_forget:
-            suggestion_index = suggestion_to_forget[SUGGESTION_ID_DICT_KEY]
-            assert isinstance(suggestion_index, str)
-            if suggestion_index in self.outstanding_suggestions:
-                del self.outstanding_suggestions[suggestion_index]
-                self._delete_outstanding_suggestion_from_db(suggestion_index)
-            else:
-                logger.info(f"Got unrecognized suggestion uuid `{suggestion_index}`")
+        print(self.outstanding_suggestions)
+        if row_id in self.outstanding_suggestions:
+            del self.outstanding_suggestions[row_id]
+            self._delete_outstanding_suggestion_from_db(row_id)
         else:
-            pass  # It's fine to forget a suggestion without a UUID, but it doesn't do anything, we weren't remembering it anyway.
+            logger.info(f"Unrecognized row_id `{row_id}` in forget_suggestion")
 
     def initialize_from_observations(
         self, observations: List[ObservationInParam]
@@ -418,13 +418,13 @@ class CARBS:
         self, observation_in_params: ObservationInParam
     ) -> ObservationInBasic:
         input_in_param = observation_in_params.input
-        suggestion_id = input_in_param.pop(SUGGESTION_ID_DICT_KEY, None)
+        # suggestion_id = input_in_param.pop(SUGGESTION_ID_DICT_KEY, None)
         real_number_input = self._param_space_real_to_basic_space_real(input_in_param)
         return ObservationInBasic(
             real_number_input=real_number_input,
             output=float(observation_in_params.output),
             cost=float(observation_in_params.cost),
-            suggestion_id=str(suggestion_id) if suggestion_id else None,
+            # suggestion_id=str(suggestion_id) if suggestion_id else None,
         )
 
     def _basic_space_to_param_space(self, real_number_input: Tensor) -> ParamDictType:
@@ -448,17 +448,26 @@ class CARBS:
     def _remember_suggestion(
         self,
         suggestion_in_param: ParamDictType,
-        suggestion_in_basic: SuggestionInBasic,
-        suggestion_id: Optional[str],
+        suggestion_in_basic: SuggestionInBasic
     ) -> ParamDictType:
-        if suggestion_id is None:
-            suggestion_id = str(uuid.uuid4())
-        suggestion_in_param[SUGGESTION_ID_DICT_KEY] = suggestion_id
-        self.outstanding_suggestions[suggestion_id] = suggestion_in_basic
+        """
+        Instead of a suggestion_id (UUID), we rely on 'row_id' from the DB.
+        """
+        # 1) Insert into DB
+        param_json = json.dumps(suggestion_in_param)
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO outstanding_suggestions (param_json)
+            VALUES (?)
+        """, (param_json,))
+        row_id = cursor.lastrowid  # auto-increment ID
+        conn.commit()
+        conn.close()
 
-        # NEW: Save to DB
-        self._save_outstanding_suggestion_to_db(suggestion_id, suggestion_in_param)
-
+        # 2) Store in memory
+        # Key by row_id instead of suggestion_id
+        self.outstanding_suggestions[row_id] = suggestion_in_basic
         return suggestion_in_param
 
     def _add_observation(
@@ -714,7 +723,7 @@ class CARBS:
                 )
                 if is_suggestion_remembered:
                     self._remember_suggestion(
-                        suggestion_in_param, suggestions[0], suggestion_id=suggestion_id
+                        suggestion_in_param, suggestions[0]#, suggestion_id=suggestion_id
                     )
                 return SuggestOutput(suggestion=suggestion_in_param)
         raise Exception("Cannot get a random sample :(")
@@ -962,52 +971,43 @@ class CARBS:
     # Provide a load_from_db method to re-initialize
     # ------------------------------------------------
     @classmethod
-    def load_from_db(
-        cls,
-        config: CARBSParams,
-        params: List[Param],
-        db_path: str,
-    ) -> "CARBS":
-        """
-        Create a new CARBS instance, read all observations/suggestions from the DB,
-        rebuild success/failure/outstanding_suggestions in memory.
-        """
+    def load_from_db(cls, config: CARBSParams, params: List[Param], db_path: str) -> "CARBS":
         optimizer = cls(config, params, db_path=db_path)
 
-        # 1) Rebuild Observations
+        # Observations
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
-        rows = cursor.execute("""
-            SELECT suggestion_id, param_json, output, cost, is_failure
+        obs_rows = cursor.execute("""
+            SELECT row_id, param_json, output, cost, is_failure
             FROM observations
             ORDER BY row_id ASC
         """).fetchall()
         conn.close()
-        
-        for suggestion_id, param_json, output, cost, is_failure in rows:
+
+        for (row_id, param_json, output, cost, is_failure) in obs_rows:
             param_dict = json.loads(param_json)
             obs = ObservationInParam(
                 input=param_dict,
-                output=float(output),
-                cost=float(cost),
-                is_failure=bool(is_failure),
+                output=output,
+                cost=cost,
+                is_failure=bool(is_failure)
             )
-            optimizer._add_observation(obs)  # fill success_observations/failure_observations
+            optimizer._add_observation(obs)
 
-        # 2) Rebuild outstanding suggestions
+        # Outstanding suggestions
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
-        rows = cursor.execute("""
-            SELECT suggestion_id, param_json
+        sugg_rows = cursor.execute("""
+            SELECT row_id, param_json
             FROM outstanding_suggestions
         """).fetchall()
         conn.close()
 
-        for suggestion_id, param_json in rows:
+        for (row_id, param_json) in sugg_rows:
             param_dict = json.loads(param_json)
-            real_input = optimizer._param_space_real_to_basic_space_real(param_dict)
-            suggestion_in_basic = SuggestionInBasic(real_number_input=real_input)
-            optimizer.outstanding_suggestions[suggestion_id] = suggestion_in_basic
+            real_in_basic = optimizer._param_space_real_to_basic_space_real(param_dict)
+            suggestion_in_basic = SuggestionInBasic(real_number_input=real_in_basic)
+            optimizer.outstanding_suggestions[row_id] = suggestion_in_basic
 
         return optimizer
 
