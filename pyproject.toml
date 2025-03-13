@@ -16,6 +16,7 @@ dependencies = [
     "loguru",
     "numpy",
     "pyro-ppl",
+    "pytest>=8.3.5",
     "scikit-learn",
     "seaborn",
     "torch",

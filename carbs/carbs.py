@@ -468,6 +468,10 @@ class CARBS:
         # 2) Store in memory
         # Key by row_id instead of suggestion_id
         self.outstanding_suggestions[row_id] = suggestion_in_basic
+
+        # Ensure the row_id will be carried along in the final param dictionary
+        suggestion_in_param['row_id'] = row_id
+
         return suggestion_in_param
 
     def _add_observation(
