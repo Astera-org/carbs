@@ -1,6 +1,6 @@
 import os
 from typing import List
-
+import torch
 import pytest
 import wandb
 
@@ -141,9 +141,9 @@ def test_load_from_db(carbs_instance: CARBS) -> None:
     # Compare outstanding suggestions count
     assert len(new_instance.outstanding_suggestions) == len(carbs_instance.outstanding_suggestions)
 
-    os.remove(db_name)
+    # Compare actual outputs
+    for old_obs, new_obs in zip(carbs_instance.success_observations, new_instance.success_observations):
+        assert old_obs.output == new_obs.output
+        assert torch.allclose(old_obs.real_number_input, new_obs.real_number_input)
 
-    # Optionally compare actual outputs
-    # for old_obs, new_obs in zip(carbs_instance.success_observations, new_instance.success_observations):
-    #     assert old_obs.output == new_obs.output
-    #     assert torch.allclose(old_obs.real_number_input, new_obs.real_number_input)
+    os.remove(db_name)
