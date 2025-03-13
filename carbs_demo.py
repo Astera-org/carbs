@@ -29,9 +29,11 @@ def run_test_fn(input_in_param: ParamDictType):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="CARBS optimizer demo")
     parser.add_argument('--db_path', type=str, default=None, help='Path to SQLite database for warm start')
+    parser.add_argument('--n_iter', type=int, default=10, help='Number of runs')
     args = parser.parse_args()
 
     db_path = args.db_path if args.db_path else "new_observations.db"
+    n_iter = args.n_iter if args.n_iter else 10
 
     param_spaces = [
         Param(name="learning_rate", space=LogSpace(scale=0.5), search_center=1e-4),
@@ -54,7 +56,7 @@ if __name__ == "__main__":
     else:
         logger.info(f"Starting from scratch. Observations stored in new DB: {db_path}")
 
-    for i in range(2):
+    for i in range(n_iter):
         suggestion = carbs.suggest().suggestion
         observed_value = run_test_fn(suggestion)
         obs_out = carbs.observe(
