@@ -7,6 +7,8 @@ import random
 import threading
 import traceback
 import uuid
+import json
+import sqlite3
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any
@@ -72,10 +74,15 @@ class CARBS:
               to a log space `lr = LogSpace(max=1)`
     """
 
-    def __init__(self, config: CARBSParams, params: List[Param]) -> None:
+    def __init__(self, config: CARBSParams, params: List[Param], db_path: Optional[str] = None) -> None:
         logger.info(f"Running CARBS with config {config}")
         self.config = config
         self.params = params
+        self.db_path = db_path  # NEW: path to your SQLite DB, if any
+
+        if self.db_path:
+            self._init_db_tables()  # create the table(s) if not exists
+
         experiment_name = os.environ.get(
             "EXPERIMENT_NAME", config.wandb_params.run_name
         )
@@ -142,6 +149,95 @@ class CARBS:
         if torch.cuda.is_available():
             self.device = f"cuda:{torch.cuda.current_device()}"
 
+    def _init_db_tables(self) -> None:
+        """Create 'observations' and 'outstanding_suggestions' tables if they don't exist."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        # 1) Observations table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS observations (
+                row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                param_json TEXT,
+                output REAL,
+                cost REAL,
+                is_failure BOOLEAN,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # 2) (Optional) Outstanding Suggestions
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS outstanding_suggestions (
+                row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                param_json TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+    # ------------------------------------------
+    # (B) Save Observations to DB
+    # ------------------------------------------
+    def _save_observation_to_db(self, observation: ObservationInParam) -> None:
+        if not self.db_path:
+            return
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+
+            param_json = json.dumps(observation.input)
+            cursor.execute("""
+                INSERT INTO observations (param_json, output, cost, is_failure)
+                VALUES (?, ?, ?, ?)
+            """, (
+                param_json,
+                float(observation.output),
+                float(observation.cost),
+                bool(observation.is_failure),
+            ))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Failed inserting observation into DB: {e}")
+
+
+
+    # ------------------------------------------
+    # (C) Save Outstanding Suggestions to DB
+    # ------------------------------------------
+    def _save_outstanding_suggestion_to_db(self, suggestion_id: str, suggestion_in_param: ParamDictType) -> None:
+        if not self.db_path:
+            return
+
+        param_json = json.dumps(suggestion_in_param)
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            # Use INSERT OR REPLACE so if it exists, we overwrite
+            cursor.execute("""
+                INSERT OR REPLACE INTO outstanding_suggestions (suggestion_id, param_json)
+                VALUES (?, ?)
+            """, (suggestion_id, param_json))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Failed inserting suggestion to DB: {e}")
+
+    def _delete_outstanding_suggestion_from_db(self, row_id: int) -> None:
+        if not self.db_path:
+            return
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM outstanding_suggestions WHERE row_id = ?", (row_id,))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Failed deleting suggestion row_id={row_id} from DB: {e}")
+
+
     def set_search_center(self, input_in_param: ParamDictType) -> None:
         self.search_center_in_basic = self._param_space_real_to_basic_space_real(
             input_in_param
@@ -165,7 +261,8 @@ class CARBS:
         with self._suggest_or_observe_lock:
             if self._is_random_sampling():
                 return self._get_random_suggestion(
-                    suggestion_id, is_suggestion_remembered
+                    suggestion_id, 
+                    is_suggestion_remembered
                 )
 
             suggestion_in_basic: Optional[SuggestionInBasic]
@@ -182,7 +279,7 @@ class CARBS:
                     self._remember_suggestion(
                         suggestion_in_param,
                         suggestion_in_basic,
-                        suggestion_id=suggestion_id,
+                        # suggestion_id=suggestion_id,
                     )
                 return SuggestOutput(suggestion=suggestion_in_param)
 
@@ -197,7 +294,8 @@ class CARBS:
             if suggestion_in_basic is None:
                 logger.warning("No candidates found, choosing at random")
                 return self._get_random_suggestion(
-                    suggestion_id, is_suggestion_remembered
+                    suggestion_id, 
+                    is_suggestion_remembered
                 )
 
             suggestion_in_param = self._basic_space_to_param_space(
@@ -207,7 +305,7 @@ class CARBS:
                 self._remember_suggestion(
                     suggestion_in_param,
                     suggestion_in_basic,
-                    suggestion_id=suggestion_id,
+                    # suggestion_id=suggestion_id,
                 )
             log_dict = self._get_suggestion_log(
                 suggestion_in_param, suggestion_in_basic
@@ -227,29 +325,33 @@ class CARBS:
             is_failure: bool = False -- Should be True if training did not complete properly (eg OOM error)
         )
         """
+        print(new_observation_in_param)
         with self._suggest_or_observe_lock:
-            self.forget_suggestion(new_observation_in_param.input)
+            # Retrieve row_id from observation input to forget suggestion
+            row_id = new_observation_in_param.input.pop("row_id", None)
+            if row_id is not None:
+                self.forget_suggestion(row_id)
+            # self.forget_suggestion(new_observation_in_param.input)
             self._add_observation(new_observation_in_param)
+            # NEW: insert row in DB
+            self._save_observation_to_db(new_observation_in_param)
             logs = self._get_observation_log(new_observation_in_param)
 
-            if self.config.is_saved_on_every_observation:
-                self._autosave()
+            # if self.config.is_saved_on_every_observation:
+            #     self._autosave()
 
             return ObserveOutput(logs=logs)
 
-    def forget_suggestion(self, suggestion_to_forget: ParamDictType) -> None:
+    def forget_suggestion(self, row_id: int) -> None:
         """
-        Removes suggestion from outstanding_suggestions
+        Given a row_id, remove from memory and DB.
         """
-        if SUGGESTION_ID_DICT_KEY in suggestion_to_forget:
-            suggestion_index = suggestion_to_forget[SUGGESTION_ID_DICT_KEY]
-            assert isinstance(suggestion_index, str)
-            if suggestion_index in self.outstanding_suggestions:
-                del self.outstanding_suggestions[suggestion_index]
-            else:
-                logger.info(f"Got unrecognized suggestion uuid `{suggestion_index}`")
+        print(self.outstanding_suggestions)
+        if row_id in self.outstanding_suggestions:
+            del self.outstanding_suggestions[row_id]
+            self._delete_outstanding_suggestion_from_db(row_id)
         else:
-            pass  # It's fine to forget a suggestion without a UUID, but it doesn't do anything, we weren't remembering it anyway.
+            logger.info(f"Unrecognized row_id `{row_id}` in forget_suggestion")
 
     def initialize_from_observations(
         self, observations: List[ObservationInParam]
@@ -316,13 +418,13 @@ class CARBS:
         self, observation_in_params: ObservationInParam
     ) -> ObservationInBasic:
         input_in_param = observation_in_params.input
-        suggestion_id = input_in_param.pop(SUGGESTION_ID_DICT_KEY, None)
+        # suggestion_id = input_in_param.pop(SUGGESTION_ID_DICT_KEY, None)
         real_number_input = self._param_space_real_to_basic_space_real(input_in_param)
         return ObservationInBasic(
             real_number_input=real_number_input,
             output=float(observation_in_params.output),
             cost=float(observation_in_params.cost),
-            suggestion_id=str(suggestion_id) if suggestion_id else None,
+            # suggestion_id=str(suggestion_id) if suggestion_id else None,
         )
 
     def _basic_space_to_param_space(self, real_number_input: Tensor) -> ParamDictType:
@@ -346,13 +448,26 @@ class CARBS:
     def _remember_suggestion(
         self,
         suggestion_in_param: ParamDictType,
-        suggestion_in_basic: SuggestionInBasic,
-        suggestion_id: Optional[str],
+        suggestion_in_basic: SuggestionInBasic
     ) -> ParamDictType:
-        if suggestion_id is None:
-            suggestion_id = str(uuid.uuid4())
-        suggestion_in_param[SUGGESTION_ID_DICT_KEY] = suggestion_id
-        self.outstanding_suggestions[suggestion_id] = suggestion_in_basic
+        """
+        Instead of a suggestion_id (UUID), we rely on 'row_id' from the DB.
+        """
+        # 1) Insert into DB
+        param_json = json.dumps(suggestion_in_param)
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO outstanding_suggestions (param_json)
+            VALUES (?)
+        """, (param_json,))
+        row_id = cursor.lastrowid  # auto-increment ID
+        conn.commit()
+        conn.close()
+
+        # 2) Store in memory
+        # Key by row_id instead of suggestion_id
+        self.outstanding_suggestions[row_id] = suggestion_in_basic
         return suggestion_in_param
 
     def _add_observation(
@@ -608,7 +723,7 @@ class CARBS:
                 )
                 if is_suggestion_remembered:
                     self._remember_suggestion(
-                        suggestion_in_param, suggestions[0], suggestion_id=suggestion_id
+                        suggestion_in_param, suggestions[0]#, suggestion_id=suggestion_id
                     )
                 return SuggestOutput(suggestion=suggestion_in_param)
         raise Exception("Cannot get a random sample :(")
@@ -851,6 +966,52 @@ class CARBS:
             io.BytesIO(base64.b64decode(state)), is_wandb_logging_enabled
         )
 
+
+    # ------------------------------------------------
+    # Provide a load_from_db method to re-initialize
+    # ------------------------------------------------
+    @classmethod
+    def load_from_db(cls, config: CARBSParams, params: List[Param], db_path: str) -> "CARBS":
+        optimizer = cls(config, params, db_path=db_path)
+
+        # Observations
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        obs_rows = cursor.execute("""
+            SELECT row_id, param_json, output, cost, is_failure
+            FROM observations
+            ORDER BY row_id ASC
+        """).fetchall()
+        conn.close()
+
+        for (row_id, param_json, output, cost, is_failure) in obs_rows:
+            param_dict = json.loads(param_json)
+            obs = ObservationInParam(
+                input=param_dict,
+                output=output,
+                cost=cost,
+                is_failure=bool(is_failure)
+            )
+            optimizer._add_observation(obs)
+
+        # Outstanding suggestions
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        sugg_rows = cursor.execute("""
+            SELECT row_id, param_json
+            FROM outstanding_suggestions
+        """).fetchall()
+        conn.close()
+
+        for (row_id, param_json) in sugg_rows:
+            param_dict = json.loads(param_json)
+            real_in_basic = optimizer._param_space_real_to_basic_space_real(param_dict)
+            suggestion_in_basic = SuggestionInBasic(real_number_input=real_in_basic)
+            optimizer.outstanding_suggestions[row_id] = suggestion_in_basic
+
+        return optimizer
+
+
     def get_state_dict(self) -> Dict[str, Any]:
         outstanding_suggestions: Dict[str, SuggestionInBasic] = {}
         for key, suggestion in self.outstanding_suggestions.items():
@@ -902,86 +1063,63 @@ class CARBS:
 
     def warm_start(
         self,
-        filename: str,
         is_prior_observation_valid: bool = False,
         added_parameters: Optional[ParamDictType] = None,
     ) -> None:
-        prior_carbs = CARBS.load_from_file(filename)
+        if not self.db_path:
+            raise ValueError("DB path must be provided for warm_start from DB.")
 
-        # Copying over observations
-        if is_prior_observation_valid:
-            prior_keys = set(prior_carbs.param_space_by_name.keys())
-            current_keys = set(self.param_space_by_name.keys())
-            added_keys = (
-                set() if added_parameters is None else set(added_parameters.keys())
-            )
-            assert_empty(
-                prior_keys - current_keys,
-                "Prior observations used params that are not included in search",
-            )
-            assert_empty(
-                current_keys - (prior_keys | added_keys), "Pass in added parameters"
-            )
-            assert_empty(added_keys & prior_keys, "Cannot add param already in prior")
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
 
-            for prior_observation_in_basic in prior_carbs.success_observations:
-                prior_observation_in_params = prior_carbs._basic_space_to_param_space(
-                    prior_observation_in_basic.real_number_input
+        # Load successful and failed observations
+        obs_rows = cursor.execute(
+            """
+            SELECT param_json, output, cost, is_failure
+            FROM observations
+            ORDER BY row_id ASC
+            """
+        ).fetchall()
+
+        for param_json, output, cost, is_failure in obs_rows:
+            param_dict = json.loads(param_json)
+
+            if added_parameters is not None:
+                param_dict.update(added_parameters)
+
+            try:
+                observation = ObservationInParam(
+                    input=param_dict,
+                    output=output,
+                    cost=cost,
+                    is_failure=bool(is_failure)
                 )
-                if added_parameters is not None:
-                    prior_observation_in_params.update(added_parameters)
+                self._add_observation(observation)
+            except ValueError as e:
+                logger.warning(f"Skipping observation {param_dict} due to error: {e}")
 
-                try:
-                    self._add_observation(
-                        ObservationInParam(
-                            input=prior_observation_in_params,
-                            output=prior_observation_in_basic.output,
-                            cost=prior_observation_in_basic.cost,
-                        )
-                    )
-                except ValueError as e:
-                    logger.warning(
-                        f"Observation {prior_observation_in_params} not valid in current space: {e}; skipping"
-                    )
+        # Load outstanding suggestions
+        sugg_rows = cursor.execute("SELECT row_id, param_json FROM outstanding_suggestions").fetchall()
 
-            logger.info(
-                f"Loaded {len(self.success_observations)} observations from prior run"
+        for row_id, param_json in sugg_rows:
+            param_dict = json.loads(param_json)
+            real_number_input = self._param_space_real_to_basic_space_real(param_dict)
+            suggestion_in_basic = SuggestionInBasic(real_number_input=real_number_input)
+            self.outstanding_suggestions[row_id] = suggestion_in_basic
+
+        conn.close()
+
+        # Set search center to best previous observation
+        if self.success_observations:
+            best_observation_in_basic = max(
+                self.success_observations,
+                key=lambda x: x.output * self.config.better_direction_sign
             )
-
-            for prior_observation_in_basic in prior_carbs.failure_observations:
-                prior_observation_in_params = prior_carbs._basic_space_to_param_space(
-                    prior_observation_in_basic.real_number_input
-                )
-                if added_parameters is not None:
-                    prior_observation_in_params.update(added_parameters)
-
-                try:
-                    self._add_observation(
-                        ObservationInParam(
-                            input=prior_observation_in_params,
-                            output=prior_observation_in_basic.output,
-                            cost=prior_observation_in_basic.cost,
-                            is_failure=True,
-                        )
-                    )
-                except ValueError as e:
-                    logger.warning(
-                        f"Observation {prior_observation_in_params} not valid in current space: {e}; skipping"
-                    )
-
-            logger.info(
-                f"Loaded {len(self.failure_observations)} failed observations from prior run"
+            best_observation_in_param = self._basic_space_to_param_space(
+                best_observation_in_basic.real_number_input
             )
+            self.set_search_center(best_observation_in_param)
 
-            self.resample_count = prior_carbs.resample_count
+        logger.info(f"Warm-started from DB with {len(self.success_observations)} successful and {len(self.failure_observations)} failed observations.")
 
-        if added_parameters is not None:
-            for param_name, param_value in added_parameters.items():
-                if param_name in self._real_number_space_by_name:
-                    param_idx = ordered_dict_index(
-                        self._real_number_space_by_name, param_name
-                    )
-                    param_value_in_basic = self._real_number_space_by_name[
-                        param_name
-                    ].basic_from_param(param_value)
-                    self.search_center_in_basic[param_idx] = param_value_in_basic
+        conn.close()
