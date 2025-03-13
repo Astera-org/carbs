@@ -10,43 +10,6 @@ CARBS depends primarily on pytorch and pyro for the Gaussian Process model. To g
 pip install -e /path/to/carbs
 ```
 
-## CARBS Demo Instructions
-
-The script `carbs_demo.py` provides a quick demonstration of how CARBS (Cost Aware Regional Bayesian Search) functions for hyperparameter tuning. You have the flexibility to start parameter tuning either from scratch or by continuing from a previous tuning session. Both methods are detailed below.
-
-### Starting from Scratch
-
-The demonstration script `carbs_demo.py`, adapted from the original notebook `notebooks/carbs_demo.ipynb`, runs the optimization process from the beginning. You can specify the number of iterations (`--n_iter`) and optionally a filename to store results (`--db_path`).
-
-To run with default settings (10 iterations, saved in `new_observations.db`):
-
-```bash
-python carbs_demo.py
-```
-This command initiates the parameter search for 10 iterations and saves the tuning observations to a new database file called `new_observations.db`.
-
-### Starting from Previous Observations
-
-You can continue hyperparameter tuning from a previously saved trajectory by specifying the path to an existing database file and the desired number of additional iterations.
-
-For example, to resume tuning from `observations.db` for 3 more iterations:
-
-```bash
-python carbs_demo.py --db_path observations.db --n_iter 3
-```
-
-This will load previous tuning data from `observations.db`, perform 3 additional optimization steps, and append the new observations to the same file.
-
-### Saving to a Custom Database
-
-If you wish to start from scratch and store results in a custom-named database file (e.g., `my_trajectory.db`), use:
-
-```bash
-python carbs_demo.py --db_path mytrajectory.db
-```
-
-This command creates a new database file named `my_trajectory.db` to store your tuning results.
-
 ## Using CARBS
 
 The primary CARBS interface is through `suggest` (which will return a new point to test) and `observe` (to report the result).
