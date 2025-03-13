@@ -166,3 +166,6 @@ cython_debug/
 
 # Ignore uv.lock
 uv.lock
+
+# Ignore all wandb logging files
+wandb/
